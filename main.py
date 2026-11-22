@@ -1,88 +1,104 @@
-"""news-image-20261122 entry: write the approved image to /output/entry.png.
+"""news-image-20261122 slot-2 entry (V6 dense variant): copy the finished
+front-page image to the output folder as entry.png.
 
-Stdlib only. No network. The image is shipped beside this program as
-image.jpg (1024x1024 JPEG, <= 1 MiB). The program copies it byte-for-byte
-to $MAKEFUN_OUTPUT_DIR/entry.png, writing DIRECTLY to the destination
-(no temp files, no atomic rename, no dotfiles in /output -- the grader
-rejects dotfiles in the output folder).
+Stdlib only, no network. The image ships beside this program as image.jpg
+(1024x1024 JPEG, <= 1 MiB). This program writes the bytes DIRECTLY to
+$MAKEFUN_OUTPUT_DIR/entry.png -- no temporary file, no atomic rename, and
+no dotfile is ever created inside the output folder (the grader rejects
+dotfiles in /output; a mkstemp-based write got the 21 Nov slot 1 rejected).
 
 Usage:
-    MAKEFUN_OUTPUT_DIR=out python3 main.py        # write entry.png
-    python3 main.py --check                        # validate image.jpg only
+    MAKEFUN_OUTPUT_DIR=out python3 main.py   # write entry.png
+    python3 main.py --check                   # validate image.jpg only
 """
 
 import hashlib
 import os
 import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SOURCE = os.path.join(HERE, "image.jpg")
-MAX_BYTES = 1_048_576
-EXPECT_W, EXPECT_H = 1024, 1024
+BASE = os.path.dirname(os.path.abspath(__file__))
+IMAGE_PATH = os.path.join(BASE, "image.jpg")
+SIZE_LIMIT = 1024 * 1024
+WANT_WIDTH = 1024
+WANT_HEIGHT = 1024
+
+# SOF markers that carry width/height (baseline, extended, progressive).
+SOF_MARKERS = frozenset((0xC0, 0xC1, 0xC2))
 
 
-def read_jpeg_dimensions(data):
-    """Parse width/height from the first SOF marker of a JPEG byte string."""
-    if len(data) < 4 or data[0:2] != b"\xff\xd8":
-        raise ValueError("not a JPEG (missing SOI marker)")
-    pos = 2
-    while pos + 9 < len(data):
-        # Skip 0xFF fill bytes that may precede a marker.
-        while pos < len(data) and data[pos] == 0xFF:
-            pos += 1
-        if pos + 9 >= len(data):
-            break
-        marker = data[pos]
-        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
-            pos += 1
+def jpeg_size(blob):
+    """Return (width, height, sof_marker) from a JPEG byte string."""
+    if blob[:2] != b"\xff\xd8":
+        raise ValueError("image.jpg is not a JPEG (no SOI marker)")
+    i = 2
+    end = len(blob)
+    while i + 1 < end:
+        if blob[i] != 0xFF:
+            i += 1
             continue
-        seg_len = (data[pos + 1] << 8) | data[pos + 2]
-        if seg_len < 2:
-            raise ValueError("bad JPEG segment length at offset %d" % pos)
-        if marker in (0xC0, 0xC1, 0xC2):
-            height = (data[pos + 4] << 8) | data[pos + 5]
-            width = (data[pos + 6] << 8) | data[pos + 7]
-            return width, height
-        pos += 1 + seg_len
-    raise ValueError("no SOF marker found")
+        # Skip padding 0xFF bytes, then read the marker code.
+        j = i + 1
+        while j < end and blob[j] == 0xFF:
+            j += 1
+        if j >= end:
+            break
+        code = blob[j]
+        if code in SOF_MARKERS:
+            if j + 8 >= end:
+                raise ValueError("truncated SOF segment")
+            height = (blob[j + 4] << 8) | blob[j + 5]
+            width = (blob[j + 6] << 8) | blob[j + 7]
+            return width, height, code
+        if code in (0xD8, 0xD9) or 0xD0 <= code <= 0xD7 or code == 0x01:
+            # Standalone markers carry no length field.
+            i = j + 1
+            continue
+        if j + 2 >= end:
+            raise ValueError("truncated JPEG segment header")
+        length = (blob[j + 1] << 8) | blob[j + 2]
+        if length < 2:
+            raise ValueError("bad JPEG segment length")
+        i = j + 1 + length
+    raise ValueError("no SOF marker found in image.jpg")
 
 
-def load_and_validate():
-    with open(SOURCE, "rb") as f:
-        data = f.read()
-    if len(data) > MAX_BYTES:
-        raise ValueError("image.jpg is %d bytes, over the 1 MiB cap" % len(data))
-    if not data.endswith(b"\xff\xd9"):
-        raise ValueError("JPEG missing end marker")
-    width, height = read_jpeg_dimensions(data)
-    if (width, height) != (EXPECT_W, EXPECT_H):
-        raise ValueError("dimensions %dx%d, expected 1024x1024" % (width, height))
-    return data
+def load_image():
+    with open(IMAGE_PATH, "rb") as handle:
+        blob = handle.read()
+    if len(blob) > SIZE_LIMIT:
+        raise ValueError("image.jpg is %d bytes, over the 1 MiB cap" % len(blob))
+    if blob[-2:] != b"\xff\xd9":
+        raise ValueError("image.jpg is missing its EOI marker")
+    width, height, sof = jpeg_size(blob)
+    if (width, height) != (WANT_WIDTH, WANT_HEIGHT):
+        raise ValueError(
+            "image.jpg is %dx%d, expected 1024x1024" % (width, height))
+    return blob, sof
 
 
-def main(argv):
+def digest(blob):
+    return hashlib.sha256(blob).hexdigest()
+
+
+def run(argv):
+    blob, sof = load_image()
     if "--check" in argv:
-        data = load_and_validate()
-        print("OK: image.jpg %dx%d JPEG, %d bytes, sha256 %s"
-              % (EXPECT_W, EXPECT_H, len(data),
-                 hashlib.sha256(data).hexdigest()))
+        print("OK: image.jpg is a %dx%d JPEG (SOF 0x%02X), %d bytes, sha256 %s"
+              % (WANT_WIDTH, WANT_HEIGHT, sof, len(blob), digest(blob)))
         return 0
-    data = load_and_validate()
-    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR", "out")
+    outdir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "out"
     os.makedirs(outdir, exist_ok=True)
-    out_path = os.path.join(outdir, "entry.png")
-    # Direct write: no temp file, no rename, no dotfile in /output.
-    with open(out_path, "wb") as f:
-        f.write(data)
-    # Verify what was written, byte for byte.
-    with open(out_path, "rb") as f:
-        written = f.read()
-    if hashlib.sha256(written).hexdigest() != hashlib.sha256(data).hexdigest():
-        raise ValueError("entry.png does not match image.jpg")
-    print("wrote %s (%d bytes, sha256 %s)"
-          % (out_path, len(written), hashlib.sha256(written).hexdigest()))
+    target = os.path.join(outdir, "entry.png")
+    # Direct write to the final path: no temp file anywhere.
+    with open(target, "wb") as handle:
+        handle.write(blob)
+    with open(target, "rb") as handle:
+        written = handle.read()
+    if digest(written) != digest(blob):
+        raise ValueError("entry.png does not match image.jpg after writing")
+    print("wrote %s (%d bytes, sha256 %s)" % (target, len(written), digest(written)))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(run(sys.argv[1:]))
